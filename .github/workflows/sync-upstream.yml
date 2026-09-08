@@ -1,0 +1,130 @@
+name: Sync Upstream & Sub-branches
+
+on:
+  schedule:
+    # 每天 UTC 02:00 (北京时间 10:00) 执行
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: cmliu/edgetunnel
+  UPSTREAM_BRANCH: main
+  # 需要同步的所有子分支
+  SUB_BRANCHES: >-
+    update_worker_name_to_dkjsjfkd
+    update_worker_name_to_edgetunnel
+    update_worker_name_to_lei666
+    update_worker_name_to_ligen
+    wushi-edgetunnel]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Upstream
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+      - name: Check & Sync Main
+        id: check_main
+        run: |
+          LOCAL_SHA=$(git rev-parse HEAD)
+          UPSTREAM_SHA=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+
+          echo "local_sha=$LOCAL_SHA" >> $GITHUB_OUTPUT
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+
+          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "✅ main 已是最新，无需同步"
+            echo "has_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "🔄 上游有新提交，开始同步 main"
+            echo "  local:    $LOCAL_SHA"
+            echo "  upstream: $UPSTREAM_SHA"
+            git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit
+            git push origin main
+            echo "has_update=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync Sub-branches
+        if: steps.check_main.outputs.has_update == 'true'
+        run: |
+          UPDATED=0
+          SKIPPED=0
+
+          for BRANCH in ${{ env.SUB_BRANCHES }}; do
+            echo ""
+            echo "=== 同步分支: $BRANCH ==="
+
+            # 确保远端分支存在
+            if ! git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+              echo "⚠️ 远端分支 $BRANCH 不存在，跳过"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            # 切到子分支
+            git checkout "$BRANCH"
+
+            # 保存 wrangler.toml
+            if [ -f wrangler.toml ]; then
+              echo "📦 保留 wrangler.toml"
+              cp wrangler.toml /tmp/wrangler_${BRANCH}.toml
+              HAS_WRANGLER=true
+            else
+              echo "ℹ️ 无 wrangler.toml"
+              HAS_WRANGLER=false
+            fi
+
+            # 用 main 的内容覆盖（除了 wrangler.toml）
+            # 方法：checkout main 的所有文件，然后恢复 wrangler.toml
+            git checkout main -- .
+
+            if [ "$HAS_WRANGLER" = true ]; then
+              cp /tmp/wrangler_${BRANCH}.toml wrangler.toml
+            fi
+
+            # 检查是否有变化
+            if git diff --quiet; then
+              echo "✅ $BRANCH 无需更新（已是最新）"
+              SKIPPED=$((SKIPPED + 1))
+            else
+              git add -A
+              git commit -m "sync: 与 main (${{ steps.check_main.outputs.upstream_sha }}) 同步，保留 wrangler.toml"
+              git push origin "$BRANCH"
+              echo "✅ $BRANCH 已同步"
+              UPDATED=$((UPDATED + 1))
+            fi
+          done
+
+          echo ""
+          echo "=============================="
+          echo "📊 同步完成: 更新 $UPDATED 个分支, 跳过 $SKIPPED 个分支"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 同步结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check_main.outputs.has_update }}" = "true" ]; then
+            echo "✅ **main 已从上游同步**" >> $GITHUB_STEP_SUMMARY
+            echo "- 上游: \`${{ steps.check_main.outputs.upstream_sha }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- 本地: \`${{ steps.check_main.outputs.local_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **main 已是最新，无需操作**" >> $GITHUB_STEP_SUMMARY
+          fi
