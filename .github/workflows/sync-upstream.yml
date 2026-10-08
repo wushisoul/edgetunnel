@@ -12,13 +12,13 @@ permissions:
 env:
   UPSTREAM_REPO: cmliu/edgetunnel
   UPSTREAM_BRANCH: main
-  # 需要同步的所有子分支
+  # 需要跟随 main 更新的子分支（每个分支自己保留 wrangler.toml 里的 worker 名称与 KV 绑定）
   SUB_BRANCHES: >-
     update_worker_name_to_dkjsjfkd
     update_worker_name_to_edgetunnel
     update_worker_name_to_lei666
     update_worker_name_to_ligen
-    wushi-edgetunnel]
+    wushi-edgetunnel
 
 jobs:
   sync:
@@ -40,29 +40,12 @@ jobs:
           git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
           git fetch upstream ${{ env.UPSTREAM_BRANCH }}
 
-      - name: Check & Sync Main
-        id: check_main
+      - name: Sync Main
         run: |
-          LOCAL_SHA=$(git rev-parse HEAD)
-          UPSTREAM_SHA=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
-
-          echo "local_sha=$LOCAL_SHA" >> $GITHUB_OUTPUT
-          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
-
-          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
-            echo "✅ main 已是最新，无需同步"
-            echo "has_update=false" >> $GITHUB_OUTPUT
-          else
-            echo "🔄 上游有新提交，开始同步 main"
-            echo "  local:    $LOCAL_SHA"
-            echo "  upstream: $UPSTREAM_SHA"
-            git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit
-            git push origin main
-            echo "has_update=true" >> $GITHUB_OUTPUT
-          fi
+          git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit
+          git push origin main
 
       - name: Sync Sub-branches
-        if: steps.check_main.outputs.has_update == 'true'
         run: |
           UPDATED=0
           SKIPPED=0
@@ -73,7 +56,7 @@ jobs:
 
             # 确保远端分支存在
             if ! git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
-              echo "⚠️ 远端分支 $BRANCH 不存在，跳过"
+              echo "远端分支 $BRANCH 不存在，跳过"
               SKIPPED=$((SKIPPED + 1))
               continue
             fi
@@ -81,50 +64,119 @@ jobs:
             # 切到子分支
             git checkout "$BRANCH"
 
-            # 保存 wrangler.toml
+            # 备份该分支的 wrangler.toml（每个 worker 自己的名称与 KV 绑定都在这里）
             if [ -f wrangler.toml ]; then
-              echo "📦 保留 wrangler.toml"
-              cp wrangler.toml /tmp/wrangler_${BRANCH}.toml
-              HAS_WRANGLER=true
+              cp wrangler.toml /tmp/wrangler_branch.toml
             else
-              echo "ℹ️ 无 wrangler.toml"
-              HAS_WRANGLER=false
+              : > /tmp/wrangler_branch.toml
             fi
 
-            # 用 main 的内容覆盖（除了 wrangler.toml）
-            # 方法：checkout main 的所有文件，然后恢复 wrangler.toml
-            git checkout main -- .
+            # 用 main 的内容覆盖分支；.github/workflows 保持原样，避免推送工作流文件被 GitHub 拒绝
+            git checkout main -- . ':(exclude).github/workflows'
 
-            if [ "$HAS_WRANGLER" = true ]; then
-              cp /tmp/wrangler_${BRANCH}.toml wrangler.toml
-            fi
+            # 只把自己那份 worker 名称 / KV 绑定放回来，其余（版本号、兼容日期等）跟随 main
+            python3 - <<'PY'
+          import pathlib, re
 
-            # 检查是否有变化
-            if git diff --quiet; then
-              echo "✅ $BRANCH 无需更新（已是最新）"
+          branch_path = pathlib.Path('/tmp/wrangler_branch.toml')
+          target = pathlib.Path('wrangler.toml')
+
+          branch_txt = branch_path.read_text(encoding='utf-8') if branch_path.exists() else ''
+          main_txt = target.read_text(encoding='utf-8')
+
+
+          def kv_sections(text):
+              """取出未注释的 [[kv_namespaces]] 段落"""
+              blocks, cur = [], None
+              for line in text.splitlines():
+                  if re.match(r'^\s*\[\[kv_namespaces\]\]', line):
+                      cur = [line]
+                      blocks.append(cur)
+                      continue
+                  if cur is not None:
+                      if re.match(r'^\s*\[', line):
+                          cur = None
+                      else:
+                          cur.append(line)
+              result = []
+              for block in blocks:
+                  while block and not block[-1].strip():
+                      block.pop()
+                  if block:
+                      result.append(block)
+              return result
+
+
+          def without_kv(text):
+              """去掉 main 里的 KV 注释模板，以及可能存在的 [[kv_namespaces]] 段落"""
+              out, skipping = [], False
+              for line in text.splitlines():
+                  if re.match(r'^\s*\[\[kv_namespaces\]\]', line):
+                      skipping = True
+                      continue
+                  if skipping:
+                      if re.match(r'^\s*\[', line):
+                          skipping = False
+                      else:
+                          continue
+                  if re.match(r'^\s*#\s*(\[\[kv_namespaces\]\]|binding\s*=|id\s*=)', line):
+                      continue
+                  out.append(line)
+              return '\n'.join(out).rstrip('\n')
+
+
+          merged = main_txt
+
+          # 1) worker 名称：自定义名称保留；上游的版本号（如 v20251104）跟着 main 走
+          m = re.search(r'(?m)^\s*name\s*=\s*"([^"]*)"', branch_txt)
+          if m:
+              branch_name = m.group(1).strip()
+              if branch_name and not re.fullmatch(r'v\d{8}', branch_name):
+                  merged = re.sub(
+                      r'(?m)^(\s*name\s*=\s*)"[^"]*"',
+                      lambda mo: '%s"%s"' % (mo.group(1), branch_name),
+                      merged,
+                      count=1,
+                  )
+
+          # 2) KV 绑定：分支里启用了就整段搬回来
+          custom_kv = kv_sections(branch_txt)
+          if custom_kv:
+              merged = without_kv(merged).rstrip('\n')
+              merged = merged + '\n\n' + '\n\n'.join('\n'.join(b) for b in custom_kv)
+
+          # 保持该分支原有的结尾换行习惯，避免产生无意义的差异
+          merged = merged.rstrip('\n') + ('\n' if branch_txt.endswith('\n') else '')
+
+          if merged != main_txt:
+              target.write_text(merged, encoding='utf-8')
+              print('wrangler.toml: 已保留自定义名称/KV，其余跟随 main')
+          else:
+              print('wrangler.toml: 无需调整')
+          PY
+
+            # 与分支当前提交比较，判断是否有真实改动
+            git add -A
+            if git diff --cached --quiet; then
+              echo "$BRANCH 无需更新（已与 main 一致）"
               SKIPPED=$((SKIPPED + 1))
             else
-              git add -A
-              git commit -m "sync: 与 main (${{ steps.check_main.outputs.upstream_sha }}) 同步，保留 wrangler.toml"
+              git commit -m "sync: 跟随 main 更新（保留自定义 worker 名称与 KV 绑定）"
               git push origin "$BRANCH"
-              echo "✅ $BRANCH 已同步"
+              echo "$BRANCH 已同步"
               UPDATED=$((UPDATED + 1))
             fi
           done
 
           echo ""
           echo "=============================="
-          echo "📊 同步完成: 更新 $UPDATED 个分支, 跳过 $SKIPPED 个分支"
+          echo "同步完成: 更新 $UPDATED 个分支, 跳过 $SKIPPED 个分支"
+
 
       - name: Summary
         if: always()
         run: |
           echo "## 同步结果" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.check_main.outputs.has_update }}" = "true" ]; then
-            echo "✅ **main 已从上游同步**" >> $GITHUB_STEP_SUMMARY
-            echo "- 上游: \`${{ steps.check_main.outputs.upstream_sha }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- 本地: \`${{ steps.check_main.outputs.local_sha }}\`" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "✅ **main 已是最新，无需操作**" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "- 各子分支的 worker 名称与 KV 绑定保持不变" >> $GITHUB_STEP_SUMMARY
+          echo "- 其余配置（版本号、兼容日期等）已跟随 main 更新" >> $GITHUB_STEP_SUMMARY
