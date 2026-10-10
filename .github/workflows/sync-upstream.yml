@@ -145,6 +145,23 @@ jobs:
               merged = without_kv(merged).rstrip('\n')
               merged = merged + '\n\n' + '\n\n'.join('\n'.join(b) for b in custom_kv)
 
+          # 3) 需要固定在分支上的布尔开关（例如 workers_dev = false，用来关闭 workers.dev 公开入口）
+          for flag in ('workers_dev', 'preview_urls'):
+              m_flag = re.search(r'(?m)^[ \t]*' + flag + r'[ \t]*=[ \t]*(true|false)[ \t]*\r?$', branch_txt)
+              if not m_flag:
+                  continue
+              wanted = '%s = %s' % (flag, m_flag.group(1))
+              if re.search(r'(?m)^[ \t]*' + flag + r'[ \t]*=', merged):
+                  merged = re.sub(r'(?m)^[ \t]*' + flag + r'[ \t]*=[ \t]*(true|false)[ \t]*\r?$', wanted, merged)
+              else:
+                  anchor = re.search(r'(?m)^[ \t]*keep_vars[ \t]*=[ \t]*(true|false)[ \t]*\r?$', merged)
+                  if anchor:
+                      merged = merged[:anchor.end()] + '\n' + wanted + merged[anchor.end():]
+                  else:
+                      table = re.search(r'(?m)^[ \t]*\[', merged)
+                      pos = table.start() if table else len(merged)
+                      merged = merged[:pos].rstrip('\n') + '\n' + wanted + '\n\n' + merged[pos:]
+
           # 保持该分支原有的结尾换行习惯，避免产生无意义的差异
           merged = merged.rstrip('\n') + ('\n' if branch_txt.endswith('\n') else '')
 
@@ -161,7 +178,7 @@ jobs:
               echo "$BRANCH 无需更新（已与 main 一致）"
               SKIPPED=$((SKIPPED + 1))
             else
-              git commit -m "sync: 跟随 main 更新（保留自定义 worker 名称与 KV 绑定）"
+              git commit -m "sync: 跟随 main 更新（保留自定义 worker 名称、KV 绑定与开关）"
               git push origin "$BRANCH"
               echo "$BRANCH 已同步"
               UPDATED=$((UPDATED + 1))
@@ -178,5 +195,5 @@ jobs:
         run: |
           echo "## 同步结果" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- 各子分支的 worker 名称与 KV 绑定保持不变" >> $GITHUB_STEP_SUMMARY
+          echo "- 各子分支的 worker 名称、KV 绑定与 workers_dev 等开关保持不变" >> $GITHUB_STEP_SUMMARY
           echo "- 其余配置（版本号、兼容日期等）已跟随 main 更新" >> $GITHUB_STEP_SUMMARY
